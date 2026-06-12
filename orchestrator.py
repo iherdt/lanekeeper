@@ -111,7 +111,9 @@ class Orchestrator:
     def resolve_email(self, user_id: str, email_map: dict) -> str | None:
         return email_map.get(user_id) or (user_id if "@" in user_id else None)
 
-    def spawn(self, user_id: str, task: str, email: str | None) -> None:
+    def spawn(
+        self, user_id: str, task: str, email: str | None, use_memory: bool = True
+    ) -> None:
         color = COLORS[self._spawn_count % len(COLORS)]
         self._spawn_count += 1
         emit = make_emitter(user_id, color)
@@ -121,9 +123,12 @@ class Orchestrator:
             try:
                 child = ChildAgent(
                     user_id, self.toolkits, emit=emit,
-                    memory=self.memory.for_user(user_id),
+                    memory=self.memory.for_user(user_id) if use_memory else None,
                 )
-                emit(f"child up: {len(child.toolset.anthropic_tools)} tools, isolated history")
+                emit(
+                    f"child up: {len(child.toolset.anthropic_tools)} tools, isolated history, "
+                    f"memory {'on' if use_memory else 'off'}"
+                )
                 # Consent gate: cold users get a consent email from the SA
                 # and this lane waits; warm users pass straight through.
                 ensure_prewarmed(
@@ -167,7 +172,7 @@ class Orchestrator:
 
     def schedule(
         self, when_spec: str, user_id: str, task: str, email: str | None,
-        recurring: bool = False,
+        recurring: bool = False, use_memory: bool = True,
     ) -> None:
         delay = parse_when(when_spec)
         fire_at = datetime.datetime.now() + datetime.timedelta(seconds=delay)
@@ -177,7 +182,7 @@ class Orchestrator:
         def fire() -> None:
             label = "recurring" if recurring else "scheduled"
             print(f"{GRAY}[scheduler]{RESET} firing {label} child for {user_id}")
-            self.spawn(user_id, task, email)
+            self.spawn(user_id, task, email, use_memory=use_memory)
             if recurring and job in self.scheduled:
                 # Re-arm: HH:MM specs roll to the next occurrence (daily),
                 # +N specs repeat on a fixed interval.
@@ -231,6 +236,7 @@ def control_loop(orchestrator: Orchestrator, email_map: dict) -> None:
         "  every    <when> <user_id> <task...>           run a child on a recurring schedule\n"
         "  cancel   <user_id|all>                        cancel scheduled jobs\n"
         "  memory   <user_id>                            show a user's remembered context\n"
+        "  prefix spawn/schedule/every with --no-memory  to run without reading or writing memory\n"
         "  pin      <user_id> <fact...>                  pin a never-evicted fact to memory\n"
         "  status | help | quit\n"
         "  <when> = +30s / +10m / +2h interval, or HH:MM (next occurrence; daily when recurring)"
@@ -244,6 +250,9 @@ def control_loop(orchestrator: Orchestrator, email_map: dict) -> None:
         if not line:
             continue
         cmd, _, rest = line.partition(" ")
+        use_memory = True
+        if rest.startswith("--no-memory "):
+            use_memory, rest = False, rest[len("--no-memory "):].strip()
         try:
             if cmd == "quit":
                 running = [l for l in orchestrator.lanes if l["thread"].is_alive()]
@@ -270,7 +279,10 @@ def control_loop(orchestrator: Orchestrator, email_map: dict) -> None:
                 if not user_id or not task:
                     print("usage: spawn <user_id> <task...>")
                     continue
-                orchestrator.spawn(user_id, task, orchestrator.resolve_email(user_id, email_map))
+                orchestrator.spawn(
+                    user_id, task, orchestrator.resolve_email(user_id, email_map),
+                    use_memory=use_memory,
+                )
             elif cmd in ("schedule", "every"):
                 when, _, rest2 = rest.partition(" ")
                 user_id, _, task = rest2.partition(" ")
@@ -280,7 +292,7 @@ def control_loop(orchestrator: Orchestrator, email_map: dict) -> None:
                 orchestrator.schedule(
                     when, user_id, task,
                     orchestrator.resolve_email(user_id, email_map),
-                    recurring=(cmd == "every"),
+                    recurring=(cmd == "every"), use_memory=use_memory,
                 )
             elif cmd == "cancel":
                 if not rest:
@@ -323,6 +335,10 @@ def main() -> None:
     parser.add_argument(
         "--schedule", action="append", default=[], dest="schedules",
         help="delay a user's initial lane, keyed: --schedule <user_id>=<+10m|HH:MM>",
+    )
+    parser.add_argument(
+        "--no-memory", action="store_true", dest="no_memory",
+        help="run the initial lanes without reading or writing memory",
     )
     parser.add_argument("--toolkits", default=None, help="comma-separated, overrides .env")
     args = parser.parse_args()
@@ -381,9 +397,12 @@ def main() -> None:
         )
         email = orchestrator.resolve_email(user_id, email_map)
         if user_id in schedule_map:
-            orchestrator.schedule(schedule_map[user_id], user_id, task, email)
+            orchestrator.schedule(
+                schedule_map[user_id], user_id, task, email,
+                use_memory=not args.no_memory,
+            )
         else:
-            orchestrator.spawn(user_id, task, email)
+            orchestrator.spawn(user_id, task, email, use_memory=not args.no_memory)
 
     control_loop(orchestrator, email_map)
 

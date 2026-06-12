@@ -84,6 +84,7 @@ python orchestrator.py --sa-user agent-service@example.com \
 | `cancel <user_id\|all>` | Cancel scheduled jobs |
 | `memory <user_id>` | Show what the system remembers about a user |
 | `pin <user_id> <fact...>` | Pin a never-evicted fact to a user's memory |
+| `--no-memory` prefix on spawn/schedule/every | Run a child that neither reads nor writes memory |
 | `status` / `help` / `quit` | Lanes + scheduled jobs / command list / exit |
 
 `<when>` is `+30s` / `+10m` / `+2h` or `HH:MM` (next occurrence; daily under `every`).
@@ -129,6 +130,90 @@ Each user's memory has three tiers:
 The budget (`MEMORY_CAP_TOKENS`, default 4000) is enforced on write: over cap, the oldest half of the tail is merged into the summary with one small-model call (summarize-before-drop, so information degrades gracefully instead of disappearing); if still over, hard eviction trims oldest turns, then the summary. A failed compaction call falls back to pure eviction: memory must never block a lane.
 
 Memory is injected as a system-prompt suffix, never as replayed message history (raw replay would orphan `tool_use` ids and bloat context). Per-user locks serialize concurrent lanes for the same user; cross-user isolation is by construction, one file per user, same move as the child itself.
+
+## Feature demos
+
+A guided tour, in the order that builds the story. All of them assume the orchestrator is up:
+
+```bash
+python orchestrator.py --sa-user agent-service@example.com
+```
+
+### 1. Lane isolation and the live auth interrupt
+
+```
+spawn alice@example.com List my unread email subjects
+spawn bob@example.com   List my unread email subjects
+```
+
+If alice is warm and bob is cold, alice streams results immediately while bob's lane pauses: the SA emails bob a consent link and only bob's thread waits. Grant it and bob's lane resumes mid-flight while alice may still be running. One pause never blocks another lane, because authorization is per-user inside Arcade.
+
+### 2. One-shot consent onboarding (pre-warm)
+
+```
+adduser carol@example.com
+```
+
+No task runs. The consent gate unions every required scope per provider, sends carol ONE email with one authorize button per provider, and waits in the background. After carol grants, every future spawn or scheduled run for her starts with zero interrupts. Compare against demo 1, where consent interrupted a live task: same mechanism, different policy.
+
+### 3. Scheduling: deferred and recurring
+
+```
+schedule +2m bob@example.com Fetch today's calendar events and email me a summary. Don't ask, just send.
+every 08:00 alice@example.com Fetch today's calendar events, summarize them, and email me the summary. Don't ask, just send.
+status
+cancel bob@example.com
+```
+
+`schedule` fires once; `every` re-arms after each run (`+10m` repeats on the interval, `08:00` rolls daily). `status` shows next fire times; `cancel` takes a user or `all`. Schedules are in-process timers and die with the process; `quit` warns about pending ones.
+
+### 4. Memory: plant and recall across ephemeral children
+
+Children are destroyed after every task, so this is the demo that proves continuity lives in the memory file, not the agent:
+
+```
+spawn alice@example.com Fetch today's calendar and summarize it. Remember for all future runs: format every summary as exactly three bullets, most important first.
+memory alice@example.com
+spawn alice@example.com Fetch today's calendar and summarize it.
+```
+
+The second spawn is a brand-new child with an empty message history, yet the summary comes back as exactly three bullets. Binary outcome, no interpretation needed: it either remembered or it did not.
+
+### 5. Pinned facts
+
+```
+pin alice@example.com Always start your reply with the line "Lane: alice"
+spawn alice@example.com What is on my calendar tomorrow?
+```
+
+The marker line appears in the output. Pinned facts inject on every run and survive every compaction and eviction; they are the tier for standing instructions, where the `turns` tail in demo 4 is best-effort recency.
+
+### 6. Compaction and eviction under a tiny cap
+
+Restart with a deliberately small budget so the policy is observable:
+
+```bash
+MEMORY_CAP_TOKENS=300 python orchestrator.py --sa-user agent-service@example.com
+```
+
+```
+spawn alice@example.com What day is it today?
+spawn alice@example.com What is 2 + 2?
+spawn alice@example.com Name one fact about the moon.
+spawn alice@example.com What day is it today?
+memory alice@example.com
+```
+
+Watch `memory` output between spawns: verbatim turns disappear from the tail and an `Earlier history (compacted): ...` line grows in their place. That is summarize-before-drop firing live (one small-model call per compaction). Kill the network or the key and the same demo still stays under cap: compaction failure falls back to pure eviction.
+
+### 7. Runs without memory
+
+```
+spawn --no-memory alice@example.com Summarize my unread email
+schedule --no-memory +5m alice@example.com Run the cleanup task
+```
+
+The `--no-memory` prefix runs a child that neither reads nor writes memory: no remembered context injected, no trace left behind. Launch-time equivalent for all initial lanes: `python orchestrator.py --no-memory ...`. Use it for one-off tasks that should not pollute a user's memory (bulk experiments, debugging) or for users who should never be profiled at all.
 
 ## Field notes (learned the hard way, against the live API)
 
