@@ -29,14 +29,20 @@ class ArcadeAgent:
         self.toolset = toolset
         self.model = model
 
-    def run_turn(self, messages: list, user_id: str, on_event=print) -> list:
-        """Run one user turn to completion. Mutates and returns messages."""
+    def run_turn(
+        self, messages: list, user_id: str, on_event=print, system_extra: str | None = None
+    ) -> list:
+        """Run one user turn to completion. Mutates and returns messages.
+
+        system_extra appends per-user context (e.g. memory) to the stable
+        system prompt without touching message history."""
+        system = SYSTEM_PROMPT + ("\n\n" + system_extra if system_extra else "")
         while True:
             response = self.client.messages.create(
                 model=self.model,
                 max_tokens=16000,
                 thinking={"type": "adaptive"},
-                system=SYSTEM_PROMPT,
+                system=system,
                 tools=self.toolset.anthropic_tools,
                 messages=messages,
             )

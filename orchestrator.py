@@ -47,11 +47,13 @@ job queue for fan-out, cron or Temporal for durable schedules.
 import argparse
 import datetime
 import threading
+from pathlib import Path
 
 from arcadepy import Arcade
 
 from agent.child import ChildAgent
-from agent.config import ARCADE_API_KEY, DEFAULT_TOOLKITS, SA_TOOLKITS
+from agent.config import ARCADE_API_KEY, DEFAULT_TOOLKITS, MEMORY_CAP_TOKENS, SA_TOOLKITS
+from agent.memory import MemoryManager
 from prewarm import SERVICE_ACCOUNT, ensure_prewarmed
 
 DEFAULT_TASK = (
@@ -98,9 +100,10 @@ class Orchestrator:
     tracks lane state. Holds NO user identity of its own and never calls a
     tool; identity lives only in the children."""
 
-    def __init__(self, toolkits: list[str], sa_user: str):
+    def __init__(self, toolkits: list[str], sa_user: str, memory: MemoryManager):
         self.toolkits = toolkits
         self.sa_user = sa_user
+        self.memory = memory
         self.lanes: list[dict] = []      # {user, task, thread, result}
         self.scheduled: list[dict] = []  # {user, task, fire_at, timer}
         self._spawn_count = 0
@@ -116,7 +119,10 @@ class Orchestrator:
 
         def run() -> None:
             try:
-                child = ChildAgent(user_id, self.toolkits, emit=emit)
+                child = ChildAgent(
+                    user_id, self.toolkits, emit=emit,
+                    memory=self.memory.for_user(user_id),
+                )
                 emit(f"child up: {len(child.toolset.anthropic_tools)} tools, isolated history")
                 # Consent gate: cold users get a consent email from the SA
                 # and this lane waits; warm users pass straight through.
@@ -224,6 +230,8 @@ def control_loop(orchestrator: Orchestrator, email_map: dict) -> None:
         "  schedule <when> <user_id> <task...>           run a child once, later\n"
         "  every    <when> <user_id> <task...>           run a child on a recurring schedule\n"
         "  cancel   <user_id|all>                        cancel scheduled jobs\n"
+        "  memory   <user_id>                            show a user's remembered context\n"
+        "  pin      <user_id> <fact...>                  pin a never-evicted fact to memory\n"
         "  status | help | quit\n"
         "  <when> = +30s / +10m / +2h interval, or HH:MM (next occurrence; daily when recurring)"
     )
@@ -279,6 +287,18 @@ def control_loop(orchestrator: Orchestrator, email_map: dict) -> None:
                     print("usage: cancel <user_id|all>")
                     continue
                 orchestrator.cancel(rest.strip())
+            elif cmd == "memory":
+                if not rest:
+                    print("usage: memory <user_id>")
+                    continue
+                print(orchestrator.memory.for_user(rest.strip()).render() or "(no memory yet)")
+            elif cmd == "pin":
+                user_id, _, fact = rest.partition(" ")
+                if not user_id or not fact:
+                    print("usage: pin <user_id> <fact...>")
+                    continue
+                orchestrator.memory.for_user(user_id).pin(fact.strip())
+                print(f"pinned for {user_id}")
             else:
                 print(f"unknown command: {cmd} (try: help)")
         except Exception as exc:
@@ -331,7 +351,8 @@ def main() -> None:
         else DEFAULT_TOOLKITS
     )
 
-    orchestrator = Orchestrator(toolkits, args.sa_user)
+    memory = MemoryManager(Path("memory"), cap_tokens=MEMORY_CAP_TOKENS)
+    orchestrator = Orchestrator(toolkits, args.sa_user, memory)
 
     if args.users:
         print("Consent email routing:")

@@ -56,3 +56,5 @@ SA_TOOLKITS = [
     for t in os.environ.get("ARCADE_SA_TOOLKITS", "gmail").split(",")
     if t.strip()
 ]
+MEMORY_MODEL = os.environ.get("MEMORY_MODEL", "claude-haiku-4-5-20251001")
+MEMORY_CAP_TOKENS = int(os.environ.get("MEMORY_CAP_TOKENS", "4000"))

@@ -82,6 +82,8 @@ python orchestrator.py --sa-user agent-service@example.com \
 | `schedule <when> <user_id> <task...>` | Run a child once, later |
 | `every <when> <user_id> <task...>` | Recurring runs (`+10m` interval, `08:00` daily) |
 | `cancel <user_id\|all>` | Cancel scheduled jobs |
+| `memory <user_id>` | Show what the system remembers about a user |
+| `pin <user_id> <fact...>` | Pin a never-evicted fact to a user's memory |
 | `status` / `help` / `quit` | Lanes + scheduled jobs / command list / exit |
 
 `<when>` is `+30s` / `+10m` / `+2h` or `HH:MM` (next occurrence; daily under `every`).
@@ -112,6 +114,22 @@ Arcade models authorization as an interrupt, not an error: `AuthorizationRequire
 
 Convenience versus minimalism is a policy choice, and `prewarm.py` is where that policy lives.
 
+## Per-user memory
+
+Children are ephemeral: one task, then the thread exits and the object is garbage. Continuity lives in a third per-user resource alongside the OAuth grant: a capped memory file (`memory/<user>.json`) the orchestrator owns and a child only sees through a user-scoped view. The 08:00 digest child is a brand-new object every morning, yet it knows the user said "skip recurring standups" three days ago.
+
+Each user's memory has three tiers:
+
+| Tier | Contents | Policy |
+|---|---|---|
+| `pinned` | Standing instructions ("always send as HTML") | Never evicted |
+| `summary` | Rolling compaction of older history | Rewritten by a small-model merge call |
+| `turns` | Recent tail of verbatim (task, outcome) pairs | Oldest evicted first |
+
+The budget (`MEMORY_CAP_TOKENS`, default 4000) is enforced on write: over cap, the oldest half of the tail is merged into the summary with one small-model call (summarize-before-drop, so information degrades gracefully instead of disappearing); if still over, hard eviction trims oldest turns, then the summary. A failed compaction call falls back to pure eviction: memory must never block a lane.
+
+Memory is injected as a system-prompt suffix, never as replayed message history (raw replay would orphan `tool_use` ids and bloat context). Per-user locks serialize concurrent lanes for the same user; cross-user isolation is by construction, one file per user, same move as the child itself.
+
 ## Field notes (learned the hard way, against the live API)
 
 1. **Auth flows with a new scope set supersede the existing grant.** A working grant went `pending` (and execution went 403) after a single `auth.start` probe with a different scope union. Scope-set identity is part of the grant's identity. Consequences: the consent gate always requests the identical per-provider union, never mix per-tool `authorize()` and union `auth.start` flows for the same user, and a "warmth probe" is not passive.
@@ -139,6 +157,7 @@ agent/
   loop.py              Claude tool-use loop with the auth interrupt
   arcade_toolkit.py    discovery, per-user authorization, execution, wait_for_grant
   child.py             user-scoped child agent (one user, one toolset, one history)
+  memory.py            per-user capped memory: pinned / summary / recent tail
   cli.py               single-user interactive REPL
   config.py            .env / environment key resolution
 scripts/smoke_test.py  pre-flight: keys, connectivity, tool discovery
