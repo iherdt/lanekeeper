@@ -115,6 +115,21 @@ Arcade models authorization as an interrupt, not an error: `AuthorizationRequire
 
 Convenience versus minimalism is a policy choice, and `prewarm.py` is where that policy lives.
 
+## Why the Engine SDK and not the MCP gateway?
+
+Arcade has two doors into the same engine, and they solve different problems:
+
+- **MCP gateway**: expose Arcade's tool catalog to an *existing* MCP client (Claude Code, Cursor, claude.ai). You bring the agent, the gateway brings tools. Identity binds at connection time, typically one user per gateway configuration, and authorization happens inside the gateway's own flow.
+- **Engine SDK** (`arcadepy`): build the agent yourself, with identity and authorization as first-class API objects.
+
+Lanekeeper is the second case by definition, for three concrete reasons:
+
+1. **Identity travels per-call, not per-connection.** Lanekeeper's core primitive is `tools.execute(tool_name, input, user_id)` with a different user on every call from the same process. The MCP `tools/call` protocol has no native per-call user parameter; multi-user through the gateway would mean one connection per user, and onboarding a new identity mid-session (`adduser`) would mean provisioning a new connection instead of passing a different string.
+2. **The consent machinery needs Engine primitives the gateway hides.** Pre-warm reads `tool.requirements.authorization` to union scopes per provider, calls `auth.start(user_id, provider, scopes)` to mint one flow per provider, collects the URLs into an email, and resumes lanes via `wait_for_completion`. Through the gateway, authorization is not interceptable, so the consent-by-email flow is simply not buildable there.
+3. **Grants are scoped per consumer.** Verified live: a grant made through the MCP gateway does not carry over to the SDK path. The two doors are parallel consumers of the same engine, not layers of one stack, so mixing them for the same user produces confusing re-consents.
+
+Rule of thumb: gateway when you are giving an existing MCP client tools for one signed-in user; SDK when you are building the agent itself and identity has to travel per call.
+
 ## Per-user memory
 
 Children are ephemeral: one task, then the thread exits and the object is garbage. Continuity lives in a third per-user resource alongside the OAuth grant: a capped memory file (`memory/<user>.json`) the orchestrator owns and a child only sees through a user-scoped view. The 08:00 digest child is a brand-new object every morning, yet it knows the user said "skip recurring standups" three days ago.
